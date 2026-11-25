@@ -1,0 +1,15 @@
+name: diag
+on: workflow_dispatch
+jobs:
+  d:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          B='Mozilla/5.0 (Linux; Android 14; SM-S938B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36'
+          H=(-H "Accept: text/html,application/json,*/*;q=0.8" -H "Accept-Language: en-US,en;q=0.9")
+          for u in "https://mrcaseseg.com/products/berlia-case.js" "https://mrcaseseg.com/products/berlia-case.json" "https://mrcaseseg.com/products/berlia-case?variant=68098344911100" "https://mrcaseseg.myshopify.com/products/berlia-case.js" "https://mrcaseseg.com/products.json?limit=250"; do
+            for ua in "Mozilla/5.0 restock-watch" "$B"; do
+              c=$(curl -s -o /tmp/o -w "%{http_code}" -A "$ua" "${H[@]}" "$u"); echo "$c ${#ua} $u $(head -c 80 /tmp/o | tr -d '\n')"
+            done
+          done
+          curl -s https://api.ipify.org; echo
