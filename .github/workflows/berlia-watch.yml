@@ -1,7 +1,7 @@
 name: Berlia S25 Ultra Transparent restock watch
 
-# GitHub's cron timer is best-effort and was skipping runs for ~10 hours.
-# So each run checks once an hour for ~5h50m, then starts the next run itself.
+# GitHub's cron timer is best-effort (it skipped runs for ~10 hours), so each run
+# checks once an hour for ~5h50m and then starts the next run itself.
 # The cron below is only a backup to restart the chain if it ever breaks.
 on:
   schedule:
@@ -12,6 +12,14 @@ on:
         description: "Send a test push with the current status"
         type: boolean
         default: true
+      fails:
+        description: "Internal: failed checks carried over from the previous run"
+        default: "0"
+
+# Only one watcher at a time; a new run waits until the current one ends.
+concurrency:
+  group: berlia-watch
+  cancel-in-progress: false
 
 permissions:
   actions: write   # to start the next run and to disable itself when back in stock
@@ -23,6 +31,7 @@ env:
   VARIANT_ID: "68098344911100"   # S25ultra / Transparent (not MagSafe)
   CHECK_EVERY: 3600              # seconds between checks (1 hour)
   RUN_FOR: 21000                 # seconds per run (~5h50m) before handing over
+  UA: "Mozilla/5.0 (Linux; Android 14; SM-S938B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
 jobs:
   watch:
@@ -34,8 +43,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           IS_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test }}
+          CARRIED_FAILS: ${{ inputs.fails || '0' }}
           REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
         run: |
           set -u
           if [ -z "$NTFY_TOPIC" ]; then
@@ -48,55 +57,53 @@ jobs:
                  -H "Click: $PRODUCT_URL" -d "$2" "https://ntfy.sh/$NTFY_TOPIC"
           }
 
-          # Returns: prints "true"/"false" + price, or nothing on failure
+          handover() {  # start the next run (on a fresh GitHub server) and stop this one
+            echo "Handing over to the next run (fails=$1)"
+            gh api -X POST "repos/$REPO/actions/workflows/berlia-watch.yml/dispatches" \
+              -f ref=main -f 'inputs[test]=false' -f "inputs[fails]=$1"
+            exit 0
+          }
+
+          # Prints "<available> <price>", or fails. Retries 3x (also on 403).
           check() {
-            json=$(curl -sS --fail --retry 3 --retry-delay 20 -A "Mozilla/5.0 restock-watch" "$PRODUCT_JSON") || return 1
-            echo "$json" | jq -r --argjson id "$VARIANT_ID" \
-              '.variants[] | select(.id == $id) | "\(.available) \(.price / 100)"'
+            json=$(curl -sS --fail --retry 3 --retry-all-errors --retry-delay 30 \
+                   -A "$UA" -H "Accept: application/json,*/*;q=0.8" -H "Accept-Language: en-US,en;q=0.9" \
+                   "$PRODUCT_JSON?t=$(date +%s)") || return 1
+            out=$(echo "$json" | jq -r --argjson id "$VARIANT_ID" \
+              '.variants[] | select(.id == $id) | "\(.available) \(.price / 100)"')
+            [ -n "$out" ] && echo "$out"
           }
 
-          other_runs() {  # other runs of this workflow currently running
-            gh api "repos/$REPO/actions/workflows/berlia-watch.yml/runs?status=in_progress" \
-              --jq "[.workflow_runs[] | select(.id != $RUN_ID)] | length" 2>/dev/null || echo 0
-          }
-
-          # Manual test: one check + a push with the result
-          if [ "$IS_TEST" = "true" ]; then
-            r=$(check) || r=""
-            if [ -z "$r" ]; then
-              notify "Berlia watch TEST: FAILED" "Could not read the S25 Ultra Transparent stock." high warning
-            else
-              set -- $r
-              notify "Berlia watch TEST: working" "S25 Ultra Transparent available=$1, LE $2. Checking every hour; you'll get a push when it's back." default white_check_mark
-            fi
-          fi
-
-          # Don't run two watchers at once (backup cron may overlap the chain)
-          if [ "$(other_runs)" -gt 0 ]; then
-            echo "Another watcher run is already active - exiting."; exit 0
-          fi
-
-          fails=0
+          fails=$CARRIED_FAILS
+          first=1
           while :; do
             r=$(check) || r=""
             if [ -z "$r" ]; then
               fails=$((fails+1)); echo "$(date -u +%FT%TZ) check failed ($fails in a row)"
-              if [ "$fails" -eq 3 ]; then
-                notify "Berlia watch: checks failing" "Couldn't read the store 3 times in a row. Will keep trying." high warning
+              [ "$fails" -eq 3 ] && notify "Berlia watch: checks failing" \
+                "The store blocked 3 checks in a row. Still trying every hour." high warning
+              if [ "$first" = 1 ] && [ "$IS_TEST" = "true" ]; then
+                notify "Berlia watch TEST: blocked, retrying" \
+                  "This GitHub server was blocked by the store; retrying on a new one." default hourglass
               fi
+              # Blocks are per GitHub server, so retry soon on a new one (up to 5 times),
+              # then fall back to the normal hourly rhythm.
+              [ "$fails" -le 5 ] && { sleep 60; handover "$fails"; }
             else
-              fails=0; set -- $r
+              set -- $r
               echo "$(date -u +%FT%TZ) S25 Ultra Transparent available=$1 price=LE $2"
               if [ "$1" = "true" ]; then
                 notify "Berlia case is BACK IN STOCK" "S25 Ultra Transparent - LE $2. Tap to open." urgent tada
                 gh workflow disable berlia-watch.yml -R "$REPO" || true
                 exit 0
               fi
+              if [ "$fails" -gt 0 ] || { [ "$first" = 1 ] && [ "$IS_TEST" = "true" ]; }; then
+                notify "Berlia watch: working" \
+                  "Still sold out (S25 Ultra Transparent, LE $2). Checking every hour; you'll get a push when it's back." default white_check_mark
+              fi
+              fails=0
             fi
-            [ $((SECONDS + CHECK_EVERY)) -ge "$RUN_FOR" ] && break
+            first=0
+            [ $((SECONDS + CHECK_EVERY)) -ge "$RUN_FOR" ] && handover "$fails"
             sleep "$CHECK_EVERY"
           done
-
-          echo "Handing over to the next run"
-          gh api -X POST "repos/$REPO/actions/workflows/berlia-watch.yml/dispatches" \
-            -f ref=main -f 'inputs[test]=false'
